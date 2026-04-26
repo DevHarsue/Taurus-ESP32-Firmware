@@ -4,26 +4,56 @@
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <SPIFFS.h>
+#include <Adafruit_Fingerprint.h>
 #include <time.h>
-#include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
 
 #include "app_config.h"
 #include "wifi_mqtt_config.h"
 
+#ifdef USE_ORIGINAL_HARDWARE
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#endif
+
 WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
+
+HardwareSerial fingerprintSerial(2);
+Adafruit_Fingerprint finger = Adafruit_Fingerprint(&fingerprintSerial);
+
+#ifdef USE_ORIGINAL_HARDWARE
 Adafruit_SSD1306 oled(OLED_WIDTH, OLED_HEIGHT, &Wire, OLED_RESET_PIN);
+#endif
 
 unsigned long lastWiFiReconnectAttemptMs = 0;
 unsigned long lastMqttReconnectAttemptMs = 0;
 unsigned long lastHeartbeatMs = 0;
 unsigned long lastOfflineSyncAttemptMs = 0;
-unsigned long lastButtonEdgeMs = 0;
+unsigned long lastFingerprintPollMs = 0;
+unsigned long lastFingerprintEventMs = 0;
 
-bool lastButtonState = HIGH;
-int simulatedFingerprintIndex = 0;
+bool fingerprintReady = false;
+
+enum class EnrollStep {
+    Idle,
+    PlaceFinger,
+    RemoveFinger,
+    PlaceAgain,
+    Building
+};
+
+struct EnrollSession {
+    bool active = false;
+    EnrollStep step = EnrollStep::Idle;
+    int fingerprintId = -1;
+    String memberId;
+    unsigned long stepStartedAtMs = 0;
+};
+
+EnrollSession enrollSession;
+
+#ifdef USE_ORIGINAL_HARDWARE
 
 void drawStatus(
     const String& line1,
@@ -59,6 +89,42 @@ void playDeniedTone() {
 void playInfoTone() {
     beep(1300, 70);
 }
+
+#else
+
+void blinkLed(int pin, int onMs, int count = 1, int offMs = 100) {
+    for (int i = 0; i < count; i++) {
+        digitalWrite(pin, HIGH);
+        delay(onMs);
+        digitalWrite(pin, LOW);
+        if (i < count - 1) delay(offMs);
+    }
+}
+
+void drawStatus(
+    const String& line1,
+    const String& line2 = "",
+    const String& line3 = ""
+) {
+    Serial.println("[STATUS] " + line1 + " | " + line2 + " | " + line3);
+    digitalWrite(LED_STATUS_PIN, HIGH);
+    delay(150);
+    digitalWrite(LED_STATUS_PIN, LOW);
+}
+
+void playGrantedTone() {
+    blinkLed(LED_GRANTED_PIN, 90, 2, 40);
+}
+
+void playDeniedTone() {
+    blinkLed(LED_DENIED_PIN, 220);
+}
+
+void playInfoTone() {
+    blinkLed(LED_INFO_PIN, 70);
+}
+
+#endif
 
 String isoTimestampNow() {
     const time_t now = time(nullptr);
@@ -169,10 +235,107 @@ void connectWiFi() {
     if (WiFi.status() == WL_CONNECTED) {
         ensureTimeSynced();
         drawStatus("WiFi conectado", WiFi.localIP().toString());
+#ifndef USE_ORIGINAL_HARDWARE
+        digitalWrite(LED_WIFI_PIN, HIGH);
+#endif
         playInfoTone();
     } else {
         drawStatus("WiFi sin conexion");
+#ifndef USE_ORIGINAL_HARDWARE
+        digitalWrite(LED_WIFI_PIN, LOW);
+#endif
     }
+}
+
+void publishEnrollProgress(
+    const String& step,
+    const String& status,
+    const String& message
+) {
+    if (!mqttClient.connected()) {
+        return;
+    }
+
+    JsonDocument doc;
+    doc["device_id"] = DEVICE_ID;
+    doc["member_id"] = enrollSession.memberId;
+    doc["fingerprint_id"] = enrollSession.fingerprintId;
+    doc["step"] = step;
+    doc["status"] = status;
+    doc["message"] = message;
+
+    String payload;
+    serializeJson(doc, payload);
+    mqttClient.publish(TOPIC_ENROLL_RESPONSE, payload.c_str());
+}
+
+void resetEnrollSession() {
+    enrollSession.active = false;
+    enrollSession.step = EnrollStep::Idle;
+    enrollSession.fingerprintId = -1;
+    enrollSession.memberId = "";
+    enrollSession.stepStartedAtMs = 0;
+}
+
+void startEnrollment(const String& memberId, int fingerprintId) {
+    if (!fingerprintReady) {
+        enrollSession.memberId = memberId;
+        enrollSession.fingerprintId = fingerprintId;
+        publishEnrollProgress("done", "failed", "AS608 no esta listo");
+        resetEnrollSession();
+        return;
+    }
+
+    if (fingerprintId < 1 || fingerprintId > 1000) {
+        enrollSession.memberId = memberId;
+        enrollSession.fingerprintId = fingerprintId;
+        publishEnrollProgress("done", "failed", "fingerprint_id fuera de rango (1-1000)");
+        resetEnrollSession();
+        return;
+    }
+
+    enrollSession.active = true;
+    enrollSession.memberId = memberId;
+    enrollSession.fingerprintId = fingerprintId;
+    enrollSession.step = EnrollStep::PlaceFinger;
+    enrollSession.stepStartedAtMs = millis();
+
+    drawStatus("Enrolando", "fp=" + String(fingerprintId), "Coloca el dedo");
+    publishEnrollProgress("place_finger", "in_progress", "Coloca el dedo en el sensor");
+    playInfoTone();
+}
+
+void deleteFingerprintSlot(int fingerprintId, const String& memberId) {
+    if (!fingerprintReady) {
+        enrollSession.memberId = memberId;
+        enrollSession.fingerprintId = fingerprintId;
+        publishEnrollProgress("delete", "failed", "AS608 no esta listo");
+        resetEnrollSession();
+        return;
+    }
+
+    enrollSession.memberId = memberId;
+    enrollSession.fingerprintId = fingerprintId;
+
+    if (fingerprintId == 0) {
+        const uint8_t result = finger.emptyDatabase();
+        publishEnrollProgress(
+            "delete",
+            result == FINGERPRINT_OK ? "success" : "failed",
+            result == FINGERPRINT_OK ? "Base de huellas borrada" : "Error al borrar base"
+        );
+    } else {
+        const uint8_t result = finger.deleteModel(static_cast<uint16_t>(fingerprintId));
+        publishEnrollProgress(
+            "delete",
+            result == FINGERPRINT_OK ? "success" : "failed",
+            result == FINGERPRINT_OK
+                ? "Slot " + String(fingerprintId) + " borrado"
+                : "Error al borrar slot " + String(fingerprintId)
+        );
+    }
+    resetEnrollSession();
+    drawStatus("Listo", DEVICE_ID);
 }
 
 void onMqttMessage(char* topic, byte* payload, unsigned int length) {
@@ -184,22 +347,43 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
         message += static_cast<char>(payload[i]);
     }
 
+    JsonDocument doc;
+    const DeserializationError err = deserializeJson(doc, message);
+
+    if (topicName == TOPIC_ENROLL_REQUEST) {
+        if (err) {
+            return;
+        }
+        const String memberId = String(static_cast<const char*>(doc["member_id"] | ""));
+        const int fingerprintId = doc["fingerprint_id"] | -1;
+        startEnrollment(memberId, fingerprintId);
+        return;
+    }
+
+    if (topicName == TOPIC_ENROLL_DELETE) {
+        if (err) {
+            return;
+        }
+        const String memberId = String(static_cast<const char*>(doc["member_id"] | ""));
+        const int fingerprintId = doc["fingerprint_id"] | -1;
+        deleteFingerprintSlot(fingerprintId, memberId);
+        return;
+    }
+
     if (topicName != TOPIC_ACCESS_RESPONSE) {
         return;
     }
 
-    JsonDocument response;
-    const DeserializationError err = deserializeJson(response, message);
     if (err) {
         drawStatus("MQTT resp invalida", err.c_str());
         playDeniedTone();
         return;
     }
 
-    const bool granted = response["granted"] | false;
-    const String name = String(static_cast<const char*>(response["name"] | ""));
-    const int daysLeft = response["days_left"] | 0;
-    const String reason = String(static_cast<const char*>(response["reason"] | ""));
+    const bool granted = doc["granted"] | false;
+    const String name = String(static_cast<const char*>(doc["name"] | ""));
+    const int daysLeft = doc["days_left"] | 0;
+    const String reason = String(static_cast<const char*>(doc["reason"] | ""));
 
     drawStatus(
         granted ? "ACCESO PERMITIDO" : "ACCESO DENEGADO",
@@ -209,6 +393,11 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
 
     if (granted) {
         playGrantedTone();
+#ifndef USE_ORIGINAL_HARDWARE
+        digitalWrite(LED_STATUS_PIN, HIGH);
+        delay(2000);
+        digitalWrite(LED_STATUS_PIN, LOW);
+#endif
     } else {
         playDeniedTone();
     }
@@ -239,11 +428,19 @@ bool connectMqtt() {
 
     if (ok) {
         mqttClient.subscribe(TOPIC_ACCESS_RESPONSE);
+        mqttClient.subscribe(TOPIC_ENROLL_REQUEST);
+        mqttClient.subscribe(TOPIC_ENROLL_DELETE);
         drawStatus("MQTT conectado", TOPIC_ACCESS_RESPONSE);
+#ifndef USE_ORIGINAL_HARDWARE
+        digitalWrite(LED_WIFI_PIN, HIGH);
+#endif
         return true;
     }
 
     drawStatus("MQTT desconectado", "rc=" + String(mqttClient.state()));
+#ifndef USE_ORIGINAL_HARDWARE
+    blinkLed(LED_WIFI_PIN, 100, 3, 100);
+#endif
     return false;
 }
 
@@ -339,37 +536,51 @@ void publishHeartbeat() {
     mqttClient.publish(TOPIC_DEVICE_HEARTBEAT, payload.c_str());
 }
 
-int nextSimulatedFingerprint() {
-    const int value = SIMULATED_FINGERPRINTS[simulatedFingerprintIndex];
-    simulatedFingerprintIndex =
-        (simulatedFingerprintIndex + 1) % SIMULATED_FINGERPRINTS_COUNT;
-    return value;
-}
-
-void handleButtonPress() {
-    const bool currentState = digitalRead(BUTTON_PIN);
-
-    if (currentState != lastButtonState) {
-        lastButtonEdgeMs = millis();
-        lastButtonState = currentState;
-    }
-
-    const bool debouncedPress =
-        currentState == LOW && (millis() - lastButtonEdgeMs) > BUTTON_DEBOUNCE_MS;
-    if (!debouncedPress) {
+void handleFingerprintScan() {
+    if (!fingerprintReady) {
         return;
     }
 
-    while (digitalRead(BUTTON_PIN) == LOW) {
-        delay(5);
+    if (enrollSession.active) {
+        return;
     }
 
-    const int fingerprintId = nextSimulatedFingerprint();
+    const unsigned long now = millis();
+    if (now - lastFingerprintPollMs < FINGERPRINT_POLL_INTERVAL_MS) {
+        return;
+    }
+    lastFingerprintPollMs = now;
+
+    if (now - lastFingerprintEventMs < FINGERPRINT_COOLDOWN_MS) {
+        return;
+    }
+
+    const uint8_t imageStatus = finger.getImage();
+    if (imageStatus == FINGERPRINT_NOFINGER) {
+        return;
+    }
+    if (imageStatus != FINGERPRINT_OK) {
+        return;
+    }
+
+    int fingerprintId = -1;
+    if (finger.image2Tz() == FINGERPRINT_OK &&
+        finger.fingerSearch() == FINGERPRINT_OK) {
+        fingerprintId = finger.fingerID;
+    }
+
+    if (fingerprintId < 0) {
+        drawStatus("Huella no reconocida");
+        playDeniedTone();
+        lastFingerprintEventMs = now;
+        return;
+    }
+
     const String timestampIso = isoTimestampNow();
     const bool delivered = publishAccessRequest(fingerprintId, timestampIso, DEVICE_ID);
 
     drawStatus(
-        "Huella simulada",
+        "Huella detectada",
         "fp=" + String(fingerprintId),
         delivered ? "enviada/queue ok" : "queue error"
     );
@@ -380,13 +591,127 @@ void handleButtonPress() {
         playDeniedTone();
     }
 
-    lastButtonState = HIGH;
-    lastButtonEdgeMs = millis();
+    lastFingerprintEventMs = now;
+}
+
+void handleEnrollment() {
+    if (!enrollSession.active) {
+        return;
+    }
+
+    const unsigned long now = millis();
+    if (now - enrollSession.stepStartedAtMs > ENROLL_FINGER_TIMEOUT_MS) {
+        publishEnrollProgress("done", "failed", "Timeout esperando dedo");
+        playDeniedTone();
+        drawStatus("Enroll timeout", "fp=" + String(enrollSession.fingerprintId));
+        resetEnrollSession();
+        return;
+    }
+
+    if (now - lastFingerprintPollMs < FINGERPRINT_POLL_INTERVAL_MS) {
+        return;
+    }
+    lastFingerprintPollMs = now;
+
+    if (enrollSession.step == EnrollStep::PlaceFinger) {
+        const uint8_t img = finger.getImage();
+        if (img == FINGERPRINT_NOFINGER) {
+            return;
+        }
+        if (img != FINGERPRINT_OK) {
+            return;
+        }
+        if (finger.image2Tz(1) != FINGERPRINT_OK) {
+            publishEnrollProgress("place_finger", "in_progress", "Imagen mala, intenta de nuevo");
+            return;
+        }
+        publishEnrollProgress("remove_finger", "in_progress", "Quita el dedo");
+        drawStatus("Enrolando", "fp=" + String(enrollSession.fingerprintId), "Quita el dedo");
+        playInfoTone();
+        enrollSession.step = EnrollStep::RemoveFinger;
+        enrollSession.stepStartedAtMs = now;
+        return;
+    }
+
+    if (enrollSession.step == EnrollStep::RemoveFinger) {
+        const uint8_t img = finger.getImage();
+        if (img == FINGERPRINT_NOFINGER) {
+            publishEnrollProgress("place_again", "in_progress", "Coloca el dedo otra vez");
+            drawStatus("Enrolando", "fp=" + String(enrollSession.fingerprintId), "Coloca otra vez");
+            enrollSession.step = EnrollStep::PlaceAgain;
+            enrollSession.stepStartedAtMs = now;
+        }
+        return;
+    }
+
+    if (enrollSession.step == EnrollStep::PlaceAgain) {
+        const uint8_t img = finger.getImage();
+        if (img == FINGERPRINT_NOFINGER) {
+            return;
+        }
+        if (img != FINGERPRINT_OK) {
+            return;
+        }
+        if (finger.image2Tz(2) != FINGERPRINT_OK) {
+            publishEnrollProgress("place_again", "in_progress", "Imagen mala, intenta de nuevo");
+            return;
+        }
+        enrollSession.step = EnrollStep::Building;
+        enrollSession.stepStartedAtMs = now;
+        return;
+    }
+
+    if (enrollSession.step == EnrollStep::Building) {
+        if (finger.createModel() != FINGERPRINT_OK) {
+            publishEnrollProgress("done", "failed", "Las dos huellas no coinciden");
+            playDeniedTone();
+            drawStatus("Enroll fallo", "huellas distintas");
+            resetEnrollSession();
+            return;
+        }
+
+        const uint8_t storeResult = finger.storeModel(static_cast<uint16_t>(enrollSession.fingerprintId));
+        if (storeResult != FINGERPRINT_OK) {
+            publishEnrollProgress("done", "failed", "Error guardando en flash");
+            playDeniedTone();
+            drawStatus("Enroll fallo", "store err");
+            resetEnrollSession();
+            return;
+        }
+
+        finger.getTemplateCount();
+        publishEnrollProgress("done", "success", "Huella enrolada correctamente");
+        drawStatus(
+            "Enroll OK",
+            "fp=" + String(enrollSession.fingerprintId),
+            "Total: " + String(finger.templateCount)
+        );
+        playGrantedTone();
+        resetEnrollSession();
+    }
+}
+
+void setupFingerprint() {
+    fingerprintSerial.begin(AS608_BAUD, SERIAL_8N1, AS608_RX_PIN, AS608_TX_PIN);
+    finger.begin(AS608_BAUD);
+
+    if (finger.verifyPassword()) {
+        fingerprintReady = true;
+        finger.getTemplateCount();
+        drawStatus(
+            "AS608 listo",
+            "Plantillas: " + String(finger.templateCount)
+        );
+        playInfoTone();
+    } else {
+        fingerprintReady = false;
+        drawStatus("AS608 no detectado", "Revisar UART/3.3V");
+        playDeniedTone();
+    }
 }
 
 void setupHardware() {
-    pinMode(BUTTON_PIN, INPUT_PULLUP);
-
+#ifdef USE_ORIGINAL_HARDWARE
     ledcSetup(BUZZER_CHANNEL, 2000, 8);
     ledcAttachPin(BUZZER_PIN, BUZZER_CHANNEL);
     ledcWriteTone(BUZZER_CHANNEL, 0);
@@ -395,6 +720,19 @@ void setupHardware() {
     oled.begin(SSD1306_SWITCHCAPVCC, 0x3C);
     oled.clearDisplay();
     oled.display();
+#else
+    pinMode(LED_GRANTED_PIN, OUTPUT);
+    pinMode(LED_DENIED_PIN, OUTPUT);
+    pinMode(LED_INFO_PIN, OUTPUT);
+    pinMode(LED_WIFI_PIN, OUTPUT);
+    pinMode(LED_STATUS_PIN, OUTPUT);
+
+    digitalWrite(LED_GRANTED_PIN, LOW);
+    digitalWrite(LED_DENIED_PIN, LOW);
+    digitalWrite(LED_INFO_PIN, LOW);
+    digitalWrite(LED_WIFI_PIN, LOW);
+    digitalWrite(LED_STATUS_PIN, LOW);
+#endif
 }
 
 void setup() {
@@ -409,6 +747,7 @@ void setup() {
         playDeniedTone();
     }
 
+    setupFingerprint();
     connectWiFi();
     connectMqtt();
     trySyncOfflineQueue();
@@ -436,7 +775,8 @@ void loop() {
     }
 
     mqttClient.loop();
-    handleButtonPress();
+    handleEnrollment();
+    handleFingerprintScan();
     publishHeartbeat();
     trySyncOfflineQueue();
 

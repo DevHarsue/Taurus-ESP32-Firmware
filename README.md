@@ -4,7 +4,7 @@ Firmware para el flujo de acceso del plan 25%:
 
 - Conexion WiFi con reconexion.
 - MQTT pub/sub contra Mosquitto.
-- Boton fisico para simular huella.
+- Sensor de huella AS608 por UART2 (57600 bps).
 - OLED para estado y resultado.
 - Buzzer para feedback.
 - Cola offline en SPIFFS.
