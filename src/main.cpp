@@ -10,7 +10,7 @@
 #include "app_config.h"
 #include "wifi_mqtt_config.h"
 
-#ifdef USE_ORIGINAL_HARDWARE
+#ifdef USE_OLED
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
@@ -22,7 +22,7 @@ PubSubClient mqttClient(wifiClient);
 HardwareSerial fingerprintSerial(2);
 Adafruit_Fingerprint finger = Adafruit_Fingerprint(&fingerprintSerial);
 
-#ifdef USE_ORIGINAL_HARDWARE
+#ifdef USE_OLED
 Adafruit_SSD1306 oled(OLED_WIDTH, OLED_HEIGHT, &Wire, OLED_RESET_PIN);
 #endif
 
@@ -31,9 +31,9 @@ unsigned long lastMqttReconnectAttemptMs = 0;
 unsigned long lastHeartbeatMs = 0;
 unsigned long lastOfflineSyncAttemptMs = 0;
 unsigned long lastFingerprintPollMs = 0;
-unsigned long lastFingerprintEventMs = 0;
 
 bool fingerprintReady = false;
+bool awaitingFingerRelease = false;
 
 enum class EnrollStep {
     Idle,
@@ -53,22 +53,82 @@ struct EnrollSession {
 
 EnrollSession enrollSession;
 
-#ifdef USE_ORIGINAL_HARDWARE
+void blinkLed(int pin, int onMs, int count = 1, int offMs = 100) {
+    for (int i = 0; i < count; i++) {
+        digitalWrite(pin, HIGH);
+        delay(onMs);
+        digitalWrite(pin, LOW);
+        if (i < count - 1) delay(offMs);
+    }
+}
+
+// ---- Estado: OLED real o LED provisional + Serial ----
+#ifdef USE_OLED
+
+String oledLine1, oledLine2, oledLine3;
+
+void renderOled() {
+    oled.clearDisplay();
+    oled.setTextSize(1);
+    oled.setTextColor(SSD1306_WHITE);
+    oled.setCursor(0, 0);
+    oled.println(oledLine1);
+    oled.println(oledLine2);
+    oled.println(oledLine3);
+    oled.display();
+}
 
 void drawStatus(
     const String& line1,
     const String& line2 = "",
     const String& line3 = ""
 ) {
-    oled.clearDisplay();
-    oled.setTextSize(1);
-    oled.setTextColor(SSD1306_WHITE);
-    oled.setCursor(0, 0);
-    oled.println(line1);
-    oled.println(line2);
-    oled.println(line3);
-    oled.display();
+    Serial.println("[STATUS] " + line1 + " | " + line2 + " | " + line3);
+    oledLine1 = line1;
+    oledLine2 = line2;
+    oledLine3 = line3;
+    renderOled();
 }
+
+// Si el OLED deja de responder por I2C (ruido, cables, caida de tension),
+// lo reinicializa solo y redibuja el ultimo estado, sin reiniciar el ESP32.
+void maintainOled() {
+    static unsigned long lastOledCheckMs = 0;
+    const unsigned long now = millis();
+    if (now - lastOledCheckMs < OLED_HEALTHCHECK_INTERVAL_MS) {
+        return;
+    }
+    lastOledCheckMs = now;
+
+    Wire.beginTransmission(OLED_I2C_ADDR);
+    if (Wire.endTransmission() == 0) {
+        return;
+    }
+
+    if (oled.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDR)) {
+        renderOled();
+    }
+}
+
+#else
+
+void drawStatus(
+    const String& line1,
+    const String& line2 = "",
+    const String& line3 = ""
+) {
+    Serial.println("[STATUS] " + line1 + " | " + line2 + " | " + line3);
+    digitalWrite(LED_STATUS_PIN, HIGH);
+    delay(150);
+    digitalWrite(LED_STATUS_PIN, LOW);
+}
+
+void maintainOled() {}
+
+#endif
+
+// ---- Tonos: buzzer real o LEDs provisionales ----
+#ifdef USE_BUZZER
 
 void beep(uint16_t frequency, uint16_t durationMs) {
     ledcWriteTone(BUZZER_CHANNEL, frequency);
@@ -92,36 +152,17 @@ void playInfoTone() {
 
 #else
 
-void blinkLed(int pin, int onMs, int count = 1, int offMs = 100) {
-    for (int i = 0; i < count; i++) {
-        digitalWrite(pin, HIGH);
-        delay(onMs);
-        digitalWrite(pin, LOW);
-        if (i < count - 1) delay(offMs);
-    }
-}
-
-void drawStatus(
-    const String& line1,
-    const String& line2 = "",
-    const String& line3 = ""
-) {
-    Serial.println("[STATUS] " + line1 + " | " + line2 + " | " + line3);
-    digitalWrite(LED_STATUS_PIN, HIGH);
-    delay(150);
-    digitalWrite(LED_STATUS_PIN, LOW);
-}
-
+// Un solo LED de feedback: distintos patrones de parpadeo por evento.
 void playGrantedTone() {
-    blinkLed(LED_GRANTED_PIN, 90, 2, 40);
+    blinkLed(LED_FEEDBACK_PIN, 90, 2, 40);   // doble parpadeo = acceso OK
 }
 
 void playDeniedTone() {
-    blinkLed(LED_DENIED_PIN, 220);
+    blinkLed(LED_FEEDBACK_PIN, 220);         // un parpadeo largo = denegado/error
 }
 
 void playInfoTone() {
-    blinkLed(LED_INFO_PIN, 70);
+    blinkLed(LED_FEEDBACK_PIN, 70);          // un parpadeo corto = info
 }
 
 #endif
@@ -235,13 +276,13 @@ void connectWiFi() {
     if (WiFi.status() == WL_CONNECTED) {
         ensureTimeSynced();
         drawStatus("WiFi conectado", WiFi.localIP().toString());
-#ifndef USE_ORIGINAL_HARDWARE
+#ifndef USE_OLED
         digitalWrite(LED_WIFI_PIN, HIGH);
 #endif
         playInfoTone();
     } else {
         drawStatus("WiFi sin conexion");
-#ifndef USE_ORIGINAL_HARDWARE
+#ifndef USE_OLED
         digitalWrite(LED_WIFI_PIN, LOW);
 #endif
     }
@@ -393,7 +434,7 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
 
     if (granted) {
         playGrantedTone();
-#ifndef USE_ORIGINAL_HARDWARE
+#ifndef USE_OLED
         digitalWrite(LED_STATUS_PIN, HIGH);
         delay(2000);
         digitalWrite(LED_STATUS_PIN, LOW);
@@ -431,14 +472,14 @@ bool connectMqtt() {
         mqttClient.subscribe(TOPIC_ENROLL_REQUEST);
         mqttClient.subscribe(TOPIC_ENROLL_DELETE);
         drawStatus("MQTT conectado", TOPIC_ACCESS_RESPONSE);
-#ifndef USE_ORIGINAL_HARDWARE
+#ifndef USE_OLED
         digitalWrite(LED_WIFI_PIN, HIGH);
 #endif
         return true;
     }
 
     drawStatus("MQTT desconectado", "rc=" + String(mqttClient.state()));
-#ifndef USE_ORIGINAL_HARDWARE
+#ifndef USE_OLED
     blinkLed(LED_WIFI_PIN, 100, 3, 100);
 #endif
     return false;
@@ -551,17 +592,21 @@ void handleFingerprintScan() {
     }
     lastFingerprintPollMs = now;
 
-    if (now - lastFingerprintEventMs < FINGERPRINT_COOLDOWN_MS) {
-        return;
-    }
-
     const uint8_t imageStatus = finger.getImage();
     if (imageStatus == FINGERPRINT_NOFINGER) {
+        awaitingFingerRelease = false;   // dedo retirado: listo para el siguiente
         return;
     }
     if (imageStatus != FINGERPRINT_OK) {
         return;
     }
+
+    // Hay imagen. Si ya procesamos este contacto, espera a que retiren el dedo
+    // antes de volver a evaluar (evita repetir el mensaje en bucle).
+    if (awaitingFingerRelease) {
+        return;
+    }
+    awaitingFingerRelease = true;
 
     int fingerprintId = -1;
     if (finger.image2Tz() == FINGERPRINT_OK &&
@@ -572,7 +617,6 @@ void handleFingerprintScan() {
     if (fingerprintId < 0) {
         drawStatus("Huella no reconocida");
         playDeniedTone();
-        lastFingerprintEventMs = now;
         return;
     }
 
@@ -590,8 +634,6 @@ void handleFingerprintScan() {
     } else {
         playDeniedTone();
     }
-
-    lastFingerprintEventMs = now;
 }
 
 void handleEnrollment() {
@@ -711,25 +753,25 @@ void setupFingerprint() {
 }
 
 void setupHardware() {
-#ifdef USE_ORIGINAL_HARDWARE
+    // ---- Feedback sonoro ----
+#ifdef USE_BUZZER
     ledcSetup(BUZZER_CHANNEL, 2000, 8);
     ledcAttachPin(BUZZER_PIN, BUZZER_CHANNEL);
     ledcWriteTone(BUZZER_CHANNEL, 0);
+#else
+    pinMode(LED_FEEDBACK_PIN, OUTPUT);
+    digitalWrite(LED_FEEDBACK_PIN, LOW);
+#endif
 
+    // ---- Display de estado ----
+#ifdef USE_OLED
     Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
-    oled.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+    oled.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDR);
     oled.clearDisplay();
     oled.display();
 #else
-    pinMode(LED_GRANTED_PIN, OUTPUT);
-    pinMode(LED_DENIED_PIN, OUTPUT);
-    pinMode(LED_INFO_PIN, OUTPUT);
     pinMode(LED_WIFI_PIN, OUTPUT);
     pinMode(LED_STATUS_PIN, OUTPUT);
-
-    digitalWrite(LED_GRANTED_PIN, LOW);
-    digitalWrite(LED_DENIED_PIN, LOW);
-    digitalWrite(LED_INFO_PIN, LOW);
     digitalWrite(LED_WIFI_PIN, LOW);
     digitalWrite(LED_STATUS_PIN, LOW);
 #endif
@@ -779,6 +821,7 @@ void loop() {
     handleFingerprintScan();
     publishHeartbeat();
     trySyncOfflineQueue();
+    maintainOled();
 
     delay(10);
 }

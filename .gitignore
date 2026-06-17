@@ -1,7 +1,7 @@
 .pio/
 .vscode/
 
-# Optional local overrides with real credentials
-include\wifi_mqtt_config.local.h
+# Local overrides with real credentials (never commit)
+include/wifi_mqtt_config.local.h
 
 *.pen

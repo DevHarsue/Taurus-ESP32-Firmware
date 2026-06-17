@@ -1,0 +1,25 @@
+#pragma once
+
+// ===========================================================================
+//  PLANTILLA de credenciales locales.
+// ---------------------------------------------------------------------------
+//  1. Copia este archivo a "wifi_mqtt_config.local.h" (en la misma carpeta).
+//  2. Rellena tus valores reales.
+//  El archivo "wifi_mqtt_config.local.h" está en .gitignore: NO se sube a git.
+// ===========================================================================
+
+// WiFi (solo redes 2.4GHz; el ESP32 no soporta 5GHz)
+#define WIFI_SSID_VALUE      "TuRedWiFi"
+#define WIFI_PASSWORD_VALUE  "TuPassword"
+
+// MQTT (Mosquitto)
+#define MQTT_HOST_VALUE      "192.168.1.x"
+#define MQTT_PORT_VALUE      1883
+#define MQTT_USER_VALUE      ""
+#define MQTT_PASSWORD_VALUE  ""
+
+// HTTP endpoint para sincronización offline
+#define API_BASE_URL_VALUE   "http://192.168.1.x:8080"
+
+// Identidad del dispositivo
+#define DEVICE_ID_VALUE      "esp32-recepcion"

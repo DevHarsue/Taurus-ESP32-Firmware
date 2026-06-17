@@ -50,15 +50,20 @@ Buzzer (-)    → GND
 
 ## 2. Configuración del firmware
 
-Edita `include/wifi_mqtt_config.h`:
+Copia la plantilla y edita el archivo local (no versionado):
+
+```bash
+cp include/wifi_mqtt_config.local.h.example include/wifi_mqtt_config.local.h
+```
 
 ```cpp
-WIFI_SSID      = "TuRedWiFi"        // Red 2.4GHz (ESP32 no soporta 5GHz puro)
-WIFI_PASSWORD  = "TuPassword"
-MQTT_HOST      = "192.168.0.103"    // IP de la PC con Docker (ipconfig)
-MQTT_PORT      = 1883
-API_BASE_URL   = "http://192.168.0.103:8080"
-DEVICE_ID      = "esp32-recepcion"
+// include/wifi_mqtt_config.local.h
+#define WIFI_SSID_VALUE      "TuRedWiFi"        // Red 2.4GHz (ESP32 no soporta 5GHz puro)
+#define WIFI_PASSWORD_VALUE  "TuPassword"
+#define MQTT_HOST_VALUE      "192.168.0.103"    // IP de la PC con Docker (ipconfig)
+#define MQTT_PORT_VALUE      1883
+#define API_BASE_URL_VALUE   "http://192.168.0.103:8080"
+#define DEVICE_ID_VALUE      "esp32-recepcion"
 ```
 
 Para encontrar la IP de tu PC en Windows:
